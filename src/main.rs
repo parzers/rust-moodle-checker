@@ -1,10 +1,12 @@
-use std::{collections::HashMap, fs, io::{self, stdin, Write}, process::{self, Stdio}};
+use std::{collections::HashMap, fs, io::{self, stdin, Write}, process::{self, Stdio}, sync::{self, atomic::AtomicU32, Arc, Mutex}};
 use moodle::client;
 use serde_json::value::Value;
 use html2text;
+use winapi::um::wincon::GenerateConsoleCtrlEvent;
+use std::sync::atomic::{Ordering, AtomicI64};
 
 const BASE_URL: &str = "https://game.spengergasse.at";
-const ASSIGNMENT_ID: &str = "2016";
+const COURSE_ID: &str = "36";
 const ZOEY_USER_ID: &str = "219";
 
 async fn get_user_fullname(client: &mut client::MoodleClient, id: i64) -> String
@@ -22,7 +24,7 @@ async fn get_user_fullname(client: &mut client::MoodleClient, id: i64) -> String
     }
 }
 
-fn test_submission(name: &str, code: &str)
+fn test_submission(name: &str, code: &str, pid: &Arc<AtomicU32>)
 {
     std::env::set_current_dir("submissions").unwrap();
     let dir = name.to_lowercase().replace(" ", "-");
@@ -40,17 +42,22 @@ fn test_submission(name: &str, code: &str)
     let mut code_file = fs::File::create("src/main.rs").unwrap();
     code_file.write_all(code.as_bytes()).unwrap();
     println!("{}", name);
-    let _ = process::Command::new("cargo")
+    let child = process::Command::new("cargo")
         .arg("run")
         .stdout(Stdio::inherit())
+        .stderr(Stdio::null())
         .stdin(Stdio::inherit())
-        .output();
+        .spawn()
+        .unwrap();
+    pid.store(child.id(), Ordering::Relaxed);
     println!("{}", code);
+    child.wait_with_output().expect("Failed to wait for child process");
+    pid.store(0, Ordering::Relaxed);
     println!("{}", name);
     std::env::set_current_dir("../..").unwrap();
 }
 
-async fn grade_submission(client: &mut client::MoodleClient, user_id: i64)
+async fn grade_submission(client: &mut client::MoodleClient, user_id: i64, assignment_id: i64)
 {
     loop {
         println!("Which grade? (P/W/M/-)");
@@ -65,7 +72,7 @@ async fn grade_submission(client: &mut client::MoodleClient, user_id: i64)
         };
 
         let mut params: HashMap<String, String> = HashMap::new();
-        params.insert("assignmentid".to_string(), ASSIGNMENT_ID.to_string());
+        params.insert("assignmentid".to_string(), assignment_id.to_string());
         params.insert("userid".to_string(), user_id.to_string());
         params.insert("grade".to_string(), grade.to_string());
         params.insert("attemptnumber".to_string(), "-1".to_string());
@@ -84,7 +91,7 @@ async fn grade_submission(client: &mut client::MoodleClient, user_id: i64)
     }
 }
 
-async fn check_submission(client: &mut client::MoodleClient, submission: &Value)
+async fn check_submission(client: &mut client::MoodleClient, submission: &Value, assignment_id: i64, pid: &Arc<AtomicU32>)
 {
     if submission["status"].as_str().unwrap_or("") != "submitted" {
         return;
@@ -99,25 +106,25 @@ async fn check_submission(client: &mut client::MoodleClient, submission: &Value)
     let submission_html = submission["plugins"][0]["editorfields"][0]["text"].as_str().unwrap_or("");
     let submission_text = html2text::from_read(submission_html.as_bytes(), 200).unwrap();
     let submission_text_trim = submission_text.trim_matches(&['`','\n']);
-    test_submission(&student_name, submission_text_trim);
-    grade_submission(client, user_id).await;
+    test_submission(&student_name, submission_text_trim, pid);
+    grade_submission(client, user_id, assignment_id).await;
 }
 
-async fn checker(client: &mut client::MoodleClient)
+async fn checker(client: &mut client::MoodleClient, assignment_id: i64, pid: &Arc<AtomicU32>)
 {
     let mut params: HashMap<String, String> = HashMap::new();
-    params.insert("assignmentids[0]".to_string(), ASSIGNMENT_ID.to_string());
+    params.insert("assignmentids[0]".to_string(), assignment_id.to_string());
     
     match client.post("mod_assign_get_submissions", &params).await {
         Ok(result) => {
             match result["assignments"][0]["submissions"].as_array() {
                 Some(submissions) => {
                     for submission in submissions {
-                        check_submission(client, submission).await;
+                        check_submission(client, submission, assignment_id, pid).await;
                     }
                 },
                 None => {
-                    println!("No submissions found for assignment {}.", ASSIGNMENT_ID);
+                    println!("No submissions found for assignment {}.", assignment_id);
                 }
             }
             //println!("{:#?}", result["assignments"][0]["submissions"][0]);
@@ -128,8 +135,68 @@ async fn checker(client: &mut client::MoodleClient)
         }
 }
 
+async fn list_assignments(client: &mut client::MoodleClient)
+{
+    let mut params: HashMap<String, String> = HashMap::new();
+    params.insert("courseids[0]".to_string(), COURSE_ID.to_string());
+
+    match client.post("mod_assign_get_assignments", &params).await {
+        Ok(result) => {
+            match result["courses"][0]["assignments"].as_array() {
+                Some(assignments) => {
+                    for assignment in assignments {
+                        let id = assignment["id"].as_i64().unwrap_or(-1);
+                        let name = assignment["name"].as_str().unwrap_or("<null>");
+                        println!("{id}: {name}");
+                    }
+                },
+                None => {
+                    println!("No assignments found in course {}.", COURSE_ID);
+                }
+            }
+        },
+        Err(e) => {
+            println!("Error fetching assignments: {e}");
+        }
+    }
+}
+
+async fn list_courses(client: &mut client::MoodleClient)
+{
+    let mut params: HashMap<String, String> = HashMap::new();
+
+    match client.post("core_course_get_courses", &params).await {
+        Ok(result) => {
+            match result.as_array() {
+                Some(courses) => {
+                    for course in courses {
+                        println!("{:#?}", course);
+                    }
+                },
+                None => {
+                    println!("No courses found.");
+                }
+            }
+        },
+        Err(e) => {
+            println!("Error fetching assignments: {e}");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    let pid = Arc::new(AtomicU32::new(0));
+    let pid_clone = Arc::clone(&pid);
+    ctrlc::set_handler(move || {
+        let pid = pid_clone.load(Ordering::Relaxed);
+        if pid > 0 {
+            unsafe {
+                GenerateConsoleCtrlEvent(1, pid);
+            }        
+        } else {
+        }
+    }).expect("Failed to set CTRL+C handler");    
     let file = fs::File::open("login.json").expect("Could not open JSON file with login information!");
     let reader = io::BufReader::new(file);
     let login_json:Value = serde_json::from_reader(reader).unwrap();
@@ -138,7 +205,9 @@ async fn main() {
     match client::login(BASE_URL, username, password).await {
         Ok(token) => {
             let mut client = client::MoodleClient::new(BASE_URL, &token);
-            checker(&mut client).await;
+            //list_courses(&mut client).await;
+            //list_assignments(&mut client).await;
+            checker(&mut client, 2032, &pid).await;
         },
         Err(e) => {
             println!("Authentication failed: {}", e);
